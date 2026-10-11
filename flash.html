@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>IDCMS | Module Registry</title>
+    <!-- Font Awesome -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
+    <!-- Google Font (Inter) -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,300;14..32,400;14..32,600;14..32,700;14..32,800&display=swap" rel="stylesheet" />
+    <style>
+        /* ----- Reset & Base ----- */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #0a0e1a;
+            font-family: 'Inter', 'Segoe UI', sans-serif;
+            padding: 20px;
+            color: #fff;
+        }
+        /* Background subtle glow */
+        .bg-glow {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: radial-gradient(ellipse at 30% 40%, rgba(67, 24, 255, 0.08) 0%, transparent 60%),
+                        radial-gradient(ellipse at 70% 60%, rgba(0, 200, 83, 0.05) 0%, transparent 60%);
+            z-index: 0;
+        }
+
+        /* ----- Main Container (glass card) ----- */
+        .registry-container {
+            position: relative;
+            z-index: 10;
+            width: 100%;
+            max-width: 1100px;
+            background: rgba(255, 255, 255, 0.03);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            border-radius: 32px;
+            padding: 2.5rem 2.5rem 2rem;
+            box-shadow: 0 40px 80px rgba(0, 0, 0, 0.6);
+            transition: opacity 0.8s ease, transform 0.8s ease;
+        }
+        .registry-container.hidden {
+            opacity: 0;
+            transform: scale(0.96) translateY(20px);
+            pointer-events: none;
+        }
+
+        /* ----- Header ----- */
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 15px;
+            margin-bottom: 2rem;
+            padding-bottom: 1rem;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+        }
+        .sys-brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .sys-brand i {
+            font-size: 2.2rem;
+            color: #7551FF;
+            filter: drop-shadow(0 0 20px rgba(117, 81, 255, 0.3));
+        }
+        .sys-brand h1 {
+            font-size: 1.8rem;
+            font-weight: 700;
+            letter-spacing: 1px;
+            background: linear-gradient(135deg, #fff 0%, #b0b8ff 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        .sys-brand .version {
+            font-size: 0.7rem;
+            font-weight: 400;
+            color: rgba(255,255,255,0.25);
+            background: rgba(255,255,255,0.05);
+            padding: 2px 12px;
+            border-radius: 20px;
+            border: 1px solid rgba(255,255,255,0.06);
+            -webkit-text-fill-color: rgba(255,255,255,0.4);
+        }
+        .status-led {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 0.75rem;
+            color: rgba(255, 255, 255, 0.4);
+            letter-spacing: 0.5px;
+        }
+        .led {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #00ff88;
+            box-shadow: 0 0 12px #00ff88;
+            animation: ledPulse 1.2s ease-in-out infinite;
+        }
+        @keyframes ledPulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.3; transform: scale(0.8); }
+        }
+
+        /* ----- Module Grid ----- */
+        .module-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+            gap: 20px;
+            margin: 1.8rem 0;
+        }
+        .module-card {
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            border-radius: 20px;
+            padding: 1.5rem 1.2rem 1.2rem;
+            transition: all 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            text-align: center;
+            gap: 8px;
+            opacity: 0.5;
+            transform: translateY(10px);
+        }
+        .module-card.visible {
+            opacity: 1;
+            transform: translateY(0);
+        }
+        .module-card .icon {
+            font-size: 2.2rem;
+            color: rgba(255, 255, 255, 0.15);
+            transition: 0.4s;
+        }
+        .module-card .name {
+            font-size: 0.95rem;
+            font-weight: 600;
+            color: rgba(255, 255, 255, 0.5);
+            transition: 0.4s;
+        }
+        .module-card .badge {
+            font-size: 0.6rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            padding: 4px 14px;
+            border-radius: 30px;
+            background: rgba(255, 255, 255, 0.05);
+            color: rgba(255, 255, 255, 0.2);
+            transition: 0.4s;
+            margin-top: 4px;
+        }
+        .module-card .status-icon {
+            font-size: 1.2rem;
+            transition: 0.4s;
+            color: rgba(255, 255, 255, 0.1);
+        }
+
+        /* States */
+        .module-card.pending {
+            border-color: rgba(255, 255, 255, 0.06);
+        }
+        .module-card.registering {
+            border-color: #7551FF;
+            box-shadow: 0 0 30px rgba(117, 81, 255, 0.1);
+            background: rgba(117, 81, 255, 0.05);
+            opacity: 1;
+            transform: translateY(0) scale(1.02);
+        }
+        .module-card.registering .icon {
+            color: #7551FF;
+        }
+        .module-card.registering .name {
+            color: #fff;
+        }
+        .module-card.registering .badge {
+            background: rgba(117, 81, 255, 0.2);
+            color: #7551FF;
+        }
+        .module-card.registering .status-icon {
+            color: #7551FF;
+            animation: spin 1s linear infinite;
+        }
+
+        .module-card.registered {
+            border-color: #00C853;
+            background: rgba(0, 200, 83, 0.05);
+            opacity: 1;
+            transform: translateY(0);
+        }
+        .module-card.registered .icon {
+            color: #00C853;
+        }
+        .module-card.registered .name {
+            color: #fff;
+        }
+        .module-card.registered .badge {
+            background: rgba(0, 200, 83, 0.15);
+            color: #00C853;
+        }
+        .module-card.registered .status-icon {
+            color: #00C853;
+            animation: none;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        /* ----- Live Console / Log ----- */
+        .console {
+            background: rgba(0, 0, 0, 0.3);
+            border: 1px solid rgba(255, 255, 255, 0.04);
+            border-radius: 16px;
+            padding: 1rem 1.2rem;
+            margin: 1.8rem 0;
+            max-height: 130px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 0.75rem;
+            color: rgba(255, 255, 255, 0.5);
+            scrollbar-width: thin;
+            scrollbar-color: rgba(255,255,255,0.05) transparent;
+        }
+        .console::-webkit-scrollbar {
+            width: 4px;
+        }
+        .console::-webkit-scrollbar-thumb {
+            background: rgba(255,255,255,0.1);
+            border-radius: 10px;
+        }
+        .console .log-line {
+            padding: 2px 0;
+            border-bottom: 1px solid rgba(255,255,255,0.02);
+            opacity: 0.8;
+            display: flex;
+            gap: 12px;
+        }
+        .console .log-line .time {
+            color: rgba(255, 255, 255, 0.2);
+            min-width: 60px;
+        }
+        .console .log-line .msg {
+            flex: 1;
+        }
+        .console .log-line .msg .ok { color: #00C853; }
+        .console .log-line .msg .warn { color: #f59e0b; }
+        .console .log-line .msg .info { color: #7551FF; }
+        .console .log-line .msg .pending { color: rgba(255,255,255,0.3); }
+
+        /* ----- Global Progress ----- */
+        .progress-global {
+            display: flex;
+            align-items: center;
+            gap: 18px;
+            margin-top: 0.8rem;
+            padding-top: 1rem;
+            border-top: 1px solid rgba(255, 255, 255, 0.04);
+        }
+        .progress-track {
+            flex: 1;
+            height: 5px;
+            background: rgba(255, 255, 255, 0.06);
+            border-radius: 10px;
+            overflow: hidden;
+        }
+        .progress-fill {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, #7551FF, #00C853);
+            border-radius: 10px;
+            transition: width 0.6s ease;
+        }
+        .progress-label {
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: rgba(255, 255, 255, 0.4);
+            min-width: 60px;
+            text-align: right;
+        }
+
+        /* Completion overlay (brief message) */
+        .completion-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(8px);
+            z-index: 100;
+            align-items: center;
+            justify-content: center;
+            flex-direction: column;
+            gap: 20px;
+            color: #fff;
+            animation: fadeIn 0.6s ease;
+        }
+        .completion-overlay.show {
+            display: flex;
+        }
+        .completion-overlay i {
+            font-size: 4rem;
+            color: #00C853;
+            animation: popIn 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        .completion-overlay h2 {
+            font-weight: 700;
+            font-size: 2.2rem;
+        }
+        .completion-overlay p {
+            color: rgba(255,255,255,0.5);
+            font-size: 1rem;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+        @keyframes popIn {
+            0% { transform: scale(0); }
+            80% { transform: scale(1.2); }
+            100% { transform: scale(1); }
+        }
+
+        /* ----- Responsive ----- */
+        @media (max-width: 768px) {
+            .registry-container { padding: 1.5rem; }
+            .module-grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 14px; }
+            .module-card { padding: 1rem; }
+            .sys-brand h1 { font-size: 1.4rem; }
+            .console { max-height: 100px; font-size: 0.65rem; }
+        }
+        @media (max-width: 480px) {
+            .module-grid { grid-template-columns: 1fr 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="bg-glow"></div>
+
+    <!-- Main Container -->
+    <div class="registry-container" id="registryContainer">
+
+        <!-- Header -->
+        <div class="header">
+            <div class="sys-brand">
+                <i class="fas fa-cubes"></i>
+                <h1>IDCMS</h1>
+                <span class="version">v2.0</span>
+            </div>
+            <div class="status-led">
+                <span class="led"></span> System Registration
+            </div>
+        </div>
+
+        <!-- Module Grid -->
+        <div class="module-grid" id="moduleGrid">
+            <!-- Cards will be generated by JS -->
+        </div>
+
+        <!-- Live Console -->
+        <div class="console" id="console"></div>
+
+        <!-- Global Progress -->
+        <div class="progress-global">
+            <div class="progress-track">
+                <div class="progress-fill" id="progressFill"></div>
+            </div>
+            <div class="progress-label" id="progressLabel">0%</div>
+        </div>
+    </div>
+
+    <!-- Completion Overlay -->
+    <div class="completion-overlay" id="completionOverlay">
+        <i class="fas fa-check-circle"></i>
+        <h2>System Ready</h2>
+        <p>All modules registered successfully</p>
+    </div>
+
+    <script>
+        (function() {
+            // ---------- Module Data ----------
+            const modules = [
+                { id: 'doc-engine',   name: 'Document Engine',      icon: 'fa-file-alt' },
+                { id: 'corr-core',    name: 'Correspondence Core',   icon: 'fa-envelope' },
+                { id: 'user-dir',     name: 'User Directory',        icon: 'fa-users' },
+                { id: 'workflow',     name: 'Workflow Service',      icon: 'fa-diagram-project' },
+                { id: 'notify-hub',   name: 'Notification Hub',      icon: 'fa-bell' },
+                { id: 'search-idx',   name: 'Search Index',          icon: 'fa-search' },
+                { id: 'security-gw',  name: 'Security Gateway',      icon: 'fa-shield-halved' },
+                { id: 'audit-log',    name: 'Audit Log',             icon: 'fa-clock-rotate-left' }
+            ];
+
+            // ---------- DOM refs ----------
+            const grid = document.getElementById('moduleGrid');
+            const consoleEl = document.getElementById('console');
+            const progressFill = document.getElementById('progressFill');
+            const progressLabel = document.getElementById('progressLabel');
+            const container = document.getElementById('registryContainer');
+            const overlay = document.getElementById('completionOverlay');
+
+            // ---------- State ----------
+            let currentIndex = 0;
+            let total = modules.length;
+            let consoleLines = [];
+
+            // ---------- Build cards ----------
+            modules.forEach((mod, idx) => {
+                const card = document.createElement('div');
+                card.className = 'module-card pending';
+                card.dataset.index = idx;
+                card.innerHTML = `
+                    <div class="icon"><i class="fas ${mod.icon}"></i></div>
+                    <div class="name">${mod.name}</div>
+                    <div class="badge">Pending</div>
+                    <div class="status-icon"><i class="fas fa-circle"></i></div>
+                `;
+                grid.appendChild(card);
+            });
+
+            // Get all card elements after DOM update
+            const cards = grid.querySelectorAll('.module-card');
+
+            // Show cards with stagger
+            cards.forEach((card, i) => {
+                setTimeout(() => card.classList.add('visible'), 100 + i * 80);
+            });
+
+            // ---------- Console helper ----------
+            function addLog(msg, type = 'info', time = null) {
+                if (!time) {
+                    const now = new Date();
+                    time = now.toTimeString().slice(0, 8);
+                }
+                const line = document.createElement('div');
+                line.className = 'log-line';
+                line.innerHTML = `
+                    <span class="time">[${time}]</span>
+                    <span class="msg"><span class="${type}">${msg}</span></span>
+                `;
+                consoleEl.appendChild(line);
+                consoleEl.scrollTop = consoleEl.scrollHeight;
+                // Keep only last 30 lines
+                while (consoleEl.children.length > 30) {
+                    consoleEl.removeChild(consoleEl.firstChild);
+                }
+            }
+
+            // Initial log
+            addLog('Registry initialization started', 'pending');
+
+            // ---------- Process next module ----------
+            function processNext() {
+                if (currentIndex >= total) {
+                    // All done
+                    completeRegistration();
+                    return;
+                }
+
+                const card = cards[currentIndex];
+                const mod = modules[currentIndex];
+                const name = mod.name;
+
+                // 1. Set to registering
+                card.className = 'module-card registering visible';
+                card.querySelector('.badge').textContent = 'Registering';
+                card.querySelector('.status-icon i').className = 'fas fa-spinner';
+
+                // Log
+                const time = new Date().toTimeString().slice(0, 8);
+                addLog(`Registering module: ${name}...`, 'info', time);
+
+                // 2. After 1.2s, mark as registered
+                setTimeout(() => {
+                    card.className = 'module-card registered visible';
+                    card.querySelector('.badge').textContent = 'Registered';
+                    card.querySelector('.status-icon i').className = 'fas fa-check-circle';
+
+                    // Log success
+                    const t2 = new Date().toTimeString().slice(0, 8);
+                    addLog(`✓ ${name} registered successfully`, 'ok', t2);
+
+                    // Update progress
+                    const progress = Math.round(((currentIndex + 1) / total) * 100);
+                    progressFill.style.width = progress + '%';
+                    progressLabel.textContent = progress + '%';
+
+                    // Move to next
+                    currentIndex++;
+                    // Small delay before next
+                    setTimeout(processNext, 400);
+                }, 1200);
+            }
+
+            // ---------- Completion ----------
+            function completeRegistration() {
+                // Show overlay
+                overlay.classList.add('show');
+
+                // Final log
+                const t = new Date().toTimeString().slice(0, 8);
+                addLog('All modules registered. System ready.', 'ok', t);
+
+                // After 2.5s, hide overlay and redirect
+                setTimeout(() => {
+                    // Fade out container
+                    container.classList.add('hidden');
+                    // Hide overlay
+                    overlay.classList.remove('show');
+                    // Redirect (adjust path as needed)
+                    setTimeout(() => {
+                        window.location.href = '../dashboard/dashboard.php';
+                    }, 800);
+                }, 2500);
+            }
+
+            // ---------- Start the process after initial display ----------
+            setTimeout(processNext, 1200);
+        })();
+    </script>
+</body>
+</html>
