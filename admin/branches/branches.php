@@ -4,7 +4,7 @@ require_once '../../config/db.php';
 checkSessionTimeout();
 
 // Check permission
-if (!hasPermission('MANAGE_OUTWARD_LETTERS')) {
+if (!hasPermission('MANAGE_BRANCHES')) {
     die('Access Denied!');
 }
 

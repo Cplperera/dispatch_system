@@ -242,6 +242,53 @@ function fetchInternalLinkedToOutward($conn, $outwardId) {
     return $s->get_result()->fetch_all(MYSQLI_ASSOC);
 }
 
+/* ────────────────────────────────────────────────────────────
+   Fetch Task Letters linked to an Outward Letter
+   Uses the `outward_task` pivot table (outward_id, task_id)
+   ──────────────────────────────────────────────────────────── */
+function fetchTasksLinkedToOutward($conn, $outwardId) {
+    $sql = "
+        SELECT DISTINCT tl.id, tl.tsk_cdr_number, tl.title, tl.status,
+                        tl.priority_status, tl.letter_date
+        FROM task_letters tl
+        JOIN outward_task ot ON tl.id = ot.task_id
+        WHERE ot.outward_id = ?
+        ORDER BY tl.letter_date DESC
+    ";
+    $s = safePrepare($conn, $sql);
+    $s->bind_param("i", $outwardId);
+    $s->execute();
+    return $s->get_result()->fetch_all(MYSQLI_ASSOC);
+}
+
+/* ────────────────────────────────────────────────────────────
+   NEW: Reply documents for a MAIN TASK (as section-4 items)
+   Returns internal letters that came in as replies, plus
+   the task they replied to.
+   ──────────────────────────────────────────────────────────── */
+function fetchReplyDocsForTasks($conn, $taskIds) {
+    if (empty($taskIds)) return [];
+    $ph    = implode(',', array_fill(0, count($taskIds), '?'));
+    $types = str_repeat('i', count($taskIds));
+    $sql   = "
+        SELECT tr.status AS reply_status, tr.replied_at,
+               r.regiment_name,
+               tl.id AS task_id, tl.tsk_cdr_number, tl.title AS task_title,
+               il.id AS internal_letter_id, il.cdr_number, il.letter_reference,
+               il.letter_title, il.letter_date, il.priority_status, il.attachment
+        FROM task_replies tr
+        JOIN regiments r ON tr.regiment_id = r.id
+        JOIN task_letters tl ON tr.task_letter_id = tl.id
+        LEFT JOIN internal_letters il ON tr.reply_internal_letter_id = il.id
+        WHERE tr.task_letter_id IN ($ph)
+        ORDER BY tr.replied_at ASC
+    ";
+    $s = safePrepare($conn, $sql);
+    $s->bind_param($types, ...$taskIds);
+    $s->execute();
+    return $s->get_result()->fetch_all(MYSQLI_ASSOC);
+}
+
 // ════════════════════════════════════════════════════════════
 // LOAD MAIN RECORD
 // ════════════════════════════════════════════════════════════
@@ -257,16 +304,84 @@ $mainRef   = $type === 'internal' ? $mainRecord['cdr_number']
 $mainTitle = $mainRecord['letter_title'] ?? $mainRecord['title'] ?? 'N/A';
 $mainDate  = $mainRecord['letter_date'];
 
+// ────────────────────────────────────────────────────────────
+// PRE-COMPUTE: reply internal IDs across the whole chain
+// (so we can keep "reply" letters out of "source")
+// ────────────────────────────────────────────────────────────
+$replyInternalIds = [];
+$tasksInChainIds  = [];   // task IDs related to the main (used for reply section)
+
+// ── Internal main ──
 $forwarding      = $type === 'internal' ? fetchForwardingHistory($conn, $id) : [];
 $disposals       = $type === 'internal' ? fetchDisposalForInternal($conn, $id) : [];
 $archives        = $type === 'internal' ? fetchArchiveForInternal($conn, $id) : [];
 $linkedOuts      = $type === 'internal' ? fetchOutwardForInternal($conn, $id) : [];
 $linkedTasks     = $type === 'internal' ? fetchTasksLinkedToInternal($conn, $id) : [];
+
+// ── Task main ──
 $agencies        = $type === 'task' ? fetchAgenciesForTask($conn, $id) : [];
 $replies         = $type === 'task' ? fetchRepliesForTask($conn, $id) : [];
-$taskSources     = $type === 'task' ? fetchInternalLinksForTask($conn, $id) : [];
+$taskSourcesRaw  = $type === 'task' ? fetchInternalLinksForTask($conn, $id) : [];
 $taskOuts        = $type === 'task' ? fetchOutwardLinkedToTask($conn, $id) : [];
-$linkedInternals = $type === 'outward' ? fetchInternalLinkedToOutward($conn, $id) : [];
+
+// ── Outward main ──
+$linkedInternalsRaw = $type === 'outward' ? fetchInternalLinkedToOutward($conn, $id) : [];
+$linkedTasksFromOutward = $type === 'outward' ? fetchTasksLinkedToOutward($conn, $id) : [];
+
+// ── Build replyInternalIds ──
+if ($type === 'task') {
+    $tasksInChainIds = [$id];
+} elseif ($type === 'internal') {
+    foreach ($linkedTasks as $t) $tasksInChainIds[] = (int)$t['id'];
+} elseif ($type === 'outward') {
+    foreach ($linkedTasksFromOutward as $t) $tasksInChainIds[] = (int)$t['id'];
+}
+
+foreach ($tasksInChainIds as $tid) {
+    foreach (fetchRepliesForTask($conn, $tid) as $r) {
+        if (!empty($r['internal_letter_id'])) {
+            $replyInternalIds[(int)$r['internal_letter_id']] = true;
+        }
+    }
+}
+
+// ── Filter: SOURCE lists must exclude replies ──
+$taskSources = array_values(array_filter(
+    $taskSourcesRaw,
+    fn($s) => !isset($replyInternalIds[(int)$s['id']])
+));
+
+$linkedInternals = array_values(array_filter(
+    $linkedInternalsRaw,
+    fn($s) => !isset($replyInternalIds[(int)$s['id']])
+));
+
+// ── REPLY docs for section 4 (task / outward / internal) ──
+// For task main: its own replies
+// For outward main: replies across all linked tasks
+// For internal main: replies across all linked tasks
+if ($type === 'task') {
+    $replyDocs = [];
+    foreach ($replies as $r) {
+        if (!empty($r['internal_letter_id'])) {
+            $replyDocs[] = [
+                'internal_letter_id' => $r['internal_letter_id'],
+                'cdr_number'         => $r['cdr_number'] ?? '',
+                'letter_reference'   => $r['letter_reference'] ?? '',
+                'letter_title'       => $r['letter_title'] ?? '',
+                'letter_date'        => $r['letter_date'] ?? '',
+                'regiment_name'      => $r['regiment_name'] ?? '',
+                'reply_status'       => $r['reply_status'] ?? '',
+                'replied_at'         => $r['replied_at'] ?? '',
+                'task_id'            => $id,
+                'tsk_cdr_number'     => $mainRecord['tsk_cdr_number'] ?? '',
+                'task_title'         => $mainRecord['title'] ?? '',
+            ];
+        }
+    }
+} else {
+    $replyDocs = fetchReplyDocsForTasks($conn, $tasksInChainIds);
+}
 
 $typeConfig = [
     'internal' => ['label' => 'Internal Letter', 'color' => '#4318FF', 'icon' => 'fa-envelope-open-text'],
@@ -291,6 +406,7 @@ $cfg = $typeConfig[$type];
     --sb-bg:#0B1437; --sb-text:#A3AED0; --sb-brand:#FFFFFF;
     --sb-active:#7551FF; --sb-active-bg:rgba(117,81,255,0.14);
     --sb-hover:rgba(255,255,255,0.04); --sb-border:rgba(255,255,255,0.06);
+    --sec-main:#4318FF; --sec-source:#29417A; --sec-task:#B45F06; --sec-reply:#107841;
 }
 [data-theme="dark"] {
     --bg:#0B1437; --card:#111C44; --text:#FFF; --muted:#A3AED0; --border:rgba(255,255,255,0.1);
@@ -303,120 +419,68 @@ body {
     transition:background 0.25s, color 0.25s;
 }
 
-/* ════════════════════════════════════════════════════════════
-   SIDEBAR — dark navy, image style
-   ════════════════════════════════════════════════════════════ */
+/* SIDEBAR */
 .sidebar {
     width:var(--sidebar-width);
     background:var(--sb-bg);
     border-right:1px solid var(--sb-border);
     padding:26px 16px 22px;
-    position:fixed;
-    height:100vh;
-    display:flex;
-    flex-direction:column;
-    overflow-y:auto;
-    z-index:100;
+    position:fixed; height:100vh;
+    display:flex; flex-direction:column;
+    overflow-y:auto; z-index:100;
 }
 .sidebar::-webkit-scrollbar { width:6px; }
 .sidebar::-webkit-scrollbar-thumb { background:rgba(255,255,255,0.08); border-radius:3px; }
-
-/* Brand */
-.brand {
-    display:flex; align-items:center; gap:10px;
-    padding:0 8px; margin-bottom:26px;
-}
+.brand { display:flex; align-items:center; gap:10px; padding:0 8px; margin-bottom:26px; }
 .brand i { color:var(--sb-active); font-size:1.35rem; }
-.brand span {
-    font-weight:800; font-size:1.25rem; color:var(--sb-brand);
-    letter-spacing:0.3px;
-}
-
-/* Nav menu container */
-.nav-menu {
-    display:flex; flex-direction:column; flex:1;
-}
-
-/* Section label ("DISPATCHING", "RECORDS") */
+.brand span { font-weight:800; font-size:1.25rem; color:var(--sb-brand); letter-spacing:0.3px; }
+.nav-menu { display:flex; flex-direction:column; flex:1; }
 .section-label {
     font-size:0.65rem; font-weight:800; color:var(--sb-text);
     text-transform:uppercase; letter-spacing:1.4px;
     padding:0 12px; margin:20px 0 8px; opacity:0.65;
 }
-
-/* Top-level nav items */
 .nav-btn {
     display:flex; align-items:center; gap:12px;
     padding:11px 13px; margin:2px 0;
     color:var(--sb-text); text-decoration:none;
     border-radius:10px; font-weight:600; font-size:0.88rem;
     background:transparent; border:none; width:100%;
-    text-align:left; cursor:pointer; transition:0.18s;
-    position:relative;
+    text-align:left; cursor:pointer; transition:0.18s; position:relative;
 }
-.nav-btn i:first-child {
-    width:20px; text-align:center; font-size:0.95rem;
-}
-.nav-btn .chevron {
-    margin-left:auto; font-size:0.72rem;
-    transition:transform 0.25s; opacity:0.8;
-}
-
-.nav-btn:hover {
-    color:#fff; background:var(--sb-hover);
-}
-
-/* Active state — soft purple tint like the image */
-.nav-btn.active {
-    color:var(--sb-active);
-    background:var(--sb-active-bg);
-    font-weight:700;
-}
+.nav-btn i:first-child { width:20px; text-align:center; font-size:0.95rem; }
+.nav-btn .chevron { margin-left:auto; font-size:0.72rem; transition:transform 0.25s; opacity:0.8; }
+.nav-btn:hover { color:#fff; background:var(--sb-hover); }
+.nav-btn.active { color:var(--sb-active); background:var(--sb-active-bg); font-weight:700; }
 .nav-btn.active i:first-child { color:var(--sb-active); }
 .nav-btn.active .chevron { transform:rotate(180deg); }
-
-/* Submenu */
 .submenu {
     max-height:0; overflow:hidden;
     transition:max-height 0.3s ease;
-    margin:2px 0 4px 22px;
-    padding-left:8px;
+    margin:2px 0 4px 22px; padding-left:8px;
     border-left:1px solid rgba(255,255,255,0.09);
 }
 .submenu.open { max-height:500px; }
-
 .sub-nav-btn {
     display:block; padding:9px 14px; margin:1px 0;
     color:var(--sb-text); text-decoration:none;
     font-size:0.82rem; font-weight:500;
     border-radius:8px; transition:0.18s;
 }
-.sub-nav-btn:hover {
-    color:#fff; background:var(--sb-hover);
-}
-.sub-nav-btn.active-sub {
-    color:var(--sb-active); font-weight:700;
-    background:var(--sb-active-bg);
-}
-
-/* Logout pinned bottom */
+.sub-nav-btn:hover { color:#fff; background:var(--sb-hover); }
+.sub-nav-btn.active-sub { color:var(--sb-active); font-weight:700; background:var(--sb-active-bg); }
 .nav-btn.logout {
     color:#ef4444; margin-top:auto;
     border-top:1px solid var(--sb-border);
-    padding-top:14px; border-radius:0;
-    padding-left:13px;
+    padding-top:14px; border-radius:0; padding-left:13px;
 }
 .nav-btn.logout i:first-child { color:#ef4444; }
-.nav-btn.logout:hover {
-    background:rgba(239,68,68,0.08); color:#ef4444;
-}
+.nav-btn.logout:hover { background:rgba(239,68,68,0.08); color:#ef4444; }
 
-/* ════════════════════════════════════════════════════════════
-   MAIN
-   ════════════════════════════════════════════════════════════ */
+/* MAIN */
 .main { margin-left:var(--sidebar-width); width:calc(100% - var(--sidebar-width)); padding:30px; }
 
-/* Hero */
+/* HERO */
 .hero {
     background:linear-gradient(135deg, var(--accent) 0%, rgba(0,0,0,0.4) 100%);
     border-radius:20px; padding:30px 35px; color:#fff; margin-bottom:25px;
@@ -446,7 +510,7 @@ body {
 .btn-hero-ghost { background:rgba(255,255,255,0.15); color:#fff; border:1px solid rgba(255,255,255,0.3); }
 .btn-hero-ghost:hover { background:rgba(255,255,255,0.25); color:#fff; }
 
-/* Cards */
+/* CARDS */
 .card {
     background:var(--card); border:1px solid var(--border); border-radius:16px;
     padding:22px; margin-bottom:20px;
@@ -459,10 +523,34 @@ body {
 }
 .card-title i { color:var(--accent); font-size:0.85rem; }
 
-/* Info grid */
-.info-grid {
-    display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:14px;
+/* SECTION BANNER */
+.section-banner {
+    display:flex; align-items:center; gap:12px;
+    padding:14px 20px; border-radius:14px;
+    color:#fff; font-weight:800; font-size:0.95rem;
+    letter-spacing:1px; text-transform:uppercase;
+    margin: 26px 0 16px;
+    box-shadow:0 6px 18px rgba(0,0,0,0.08);
 }
+.section-banner .num {
+    width:32px; height:32px; border-radius:9px;
+    background:rgba(255,255,255,0.22);
+    display:flex; align-items:center; justify-content:center;
+    font-size:1rem; font-weight:900;
+}
+.section-banner .cnt {
+    margin-left:auto; font-size:0.78rem;
+    background:rgba(255,255,255,0.22);
+    padding:4px 12px; border-radius:20px;
+    letter-spacing:0.5px;
+}
+.sb-main   { background:linear-gradient(135deg, var(--sec-main) 0%, #7551FF 100%); }
+.sb-source { background:linear-gradient(135deg, var(--sec-source) 0%, #4A6FA5 100%); }
+.sb-task   { background:linear-gradient(135deg, var(--sec-task) 0%, #D97706 100%); }
+.sb-reply  { background:linear-gradient(135deg, var(--sec-reply) 0%, #10b981 100%); }
+
+/* INFO GRID */
+.info-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:14px; }
 .info-item { padding:6px 0; }
 .info-label {
     font-size:0.68rem; color:var(--muted); font-weight:700;
@@ -472,12 +560,10 @@ body {
     font-size:0.92rem; font-weight:600; color:var(--text);
     word-break:break-word; line-height:1.4;
 }
-.info-value.mono {
-    font-family:'Courier New',monospace; color:var(--accent); font-size:0.88rem;
-}
+.info-value.mono { font-family:'Courier New',monospace; color:var(--accent); font-size:0.88rem; }
 .info-value.muted { color:var(--muted); font-weight:400; font-size:0.85rem; }
 
-/* Badges */
+/* BADGES */
 .badge {
     display:inline-block; padding:4px 12px; border-radius:20px;
     font-size:0.7rem; font-weight:700; text-transform:uppercase; letter-spacing:0.3px;
@@ -499,7 +585,7 @@ body {
 .b-approved { background:rgba(16,185,129,0.15); color:#10b981; }
 .b-rejected { background:rgba(239,68,68,0.15); color:#ef4444; }
 
-/* Tables */
+/* TABLES */
 .table-wrap { overflow-x:auto; border-radius:12px; border:1px solid var(--border); }
 .tbl { width:100%; border-collapse:collapse; font-size:0.83rem; }
 .tbl thead th {
@@ -514,7 +600,7 @@ body {
 .tbl tr:last-child td { border-bottom:none; }
 .tbl tr:hover td { background:var(--accent-soft); }
 
-/* Timeline */
+/* TIMELINE */
 .timeline { position:relative; padding-left:28px; }
 .timeline::before {
     content:''; position:absolute; left:8px; top:8px; bottom:8px;
@@ -527,10 +613,7 @@ body {
     background:var(--accent); border:3px solid var(--card);
     box-shadow:0 0 0 2px var(--accent);
 }
-.tl-head {
-    display:flex; justify-content:space-between; align-items:flex-start;
-    margin-bottom:6px; flex-wrap:wrap; gap:6px;
-}
+.tl-head { display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:6px; flex-wrap:wrap; gap:6px; }
 .tl-title { font-weight:700; font-size:0.87rem; }
 .tl-date { font-size:0.72rem; color:var(--muted); font-family:'Courier New',monospace; }
 .tl-body {
@@ -538,10 +621,8 @@ body {
     background:var(--bg); padding:10px 13px; border-radius:10px; margin-top:6px;
 }
 
-/* Link cards */
-.links-grid {
-    display:grid; grid-template-columns:repeat(auto-fill, minmax(280px, 1fr)); gap:10px;
-}
+/* LINK CARDS */
+.links-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(280px, 1fr)); gap:10px; }
 .link-item {
     display:flex; align-items:center; gap:12px; padding:12px 14px;
     background:var(--bg); border-radius:11px; text-decoration:none; color:var(--text);
@@ -558,7 +639,7 @@ body {
 .link-item .ttl { font-size:0.76rem; color:var(--muted); margin-top:2px; }
 .link-item .arr { color:var(--muted); }
 
-/* Empty state */
+/* EMPTY */
 .empty {
     text-align:center; padding:30px 20px; color:var(--muted);
     background:var(--bg); border-radius:12px;
@@ -589,7 +670,6 @@ body {
 
         <div class="section-label">Dispatching</div>
 
-        <!-- Internal Letters (active) with submenu -->
         <button type="button" class="nav-btn active nav-toggle" data-target="internalSub">
             <i class="fa-solid fa-envelope-open-text"></i>
             <span>Internal Letters</span>
@@ -602,7 +682,6 @@ body {
             <a href="unified_details.php?type=internal&id=63" class="sub-nav-btn active-sub">Internal Details</a>
         </div>
 
-        <!-- Task Letters -->
         <button type="button" class="nav-btn nav-toggle" data-target="taskSub">
             <i class="fa-solid fa-list-check"></i>
             <span>Task Letters</span>
@@ -614,7 +693,6 @@ body {
             <a href="unified_details.php?type=task&id=13" class="sub-nav-btn">Task Details</a>
         </div>
 
-        <!-- Outward Letters -->
         <button type="button" class="nav-btn nav-toggle" data-target="outwardSub">
             <i class="fa-solid fa-paper-plane"></i>
             <span>Outward Letters</span>
@@ -678,7 +756,16 @@ body {
         </div>
     </div>
 
-    <!-- ═══════════════ INTERNAL LETTER DETAILS ═══════════════ -->
+    <!-- ═══════════════════════════════════════════════════════
+         SECTION 1 — MAIN DOCUMENT
+         ═══════════════════════════════════════════════════════ -->
+    <div class="section-banner sb-main">
+        <div class="num">1</div>
+        <i class="fa-solid fa-file-lines"></i>
+        <span>Main Document</span>
+        <span class="cnt"><?= strtoupper($type) ?></span>
+    </div>
+
     <?php if ($type === 'internal'): ?>
 
     <div class="card">
@@ -694,7 +781,7 @@ body {
             <div class="info-item"><div class="info-label">Status</div><div class="info-value"><span class="badge b-status-<?= str_replace(' ','', $mainRecord['status'] ?? '') ?>"><?= htmlspecialchars($mainRecord['status'] ?? '') ?></span></div></div>
             <div class="info-item"><div class="info-label">Under Final Disposal</div><div class="info-value"><?= !empty($mainRecord['is_under_final_disposal']) ? 'Yes' : 'No' ?></div></div>
         </div>
-        <div class="info-item" style="margin-top:14px; grid-column:1/-1;">
+        <div class="info-item" style="margin-top:14px;">
             <div class="info-label">Title</div>
             <div class="info-value"><?= htmlspecialchars($mainRecord['letter_title'] ?? '') ?></div>
         </div>
@@ -823,60 +910,7 @@ body {
         <?php endif; ?>
     </div>
 
-    <?php if (!empty($linkedTasks)): ?>
-    <div class="card">
-        <div class="card-title"><i class="fa-solid fa-list-check"></i> Linked Task Letters (<?= count($linkedTasks) ?>)</div>
-        <div class="links-grid">
-            <?php foreach ($linkedTasks as $t): ?>
-            <a href="unified_details.php?type=task&id=<?= (int)$t['id'] ?>" class="link-item">
-                <div class="icon"><i class="fa-solid fa-list-check"></i></div>
-                <div class="body">
-                    <div class="ref"><?= htmlspecialchars($t['tsk_cdr_number']) ?></div>
-                    <div class="ttl"><?= htmlspecialchars(mb_substr($t['title'], 0, 55)) ?></div>
-                </div>
-                <div class="arr"><i class="fa-solid fa-chevron-right"></i></div>
-            </a>
-            <?php endforeach; ?>
-        </div>
-    </div>
-    <?php endif; ?>
-
-    <?php if (!empty($linkedOuts)): ?>
-    <div class="card">
-        <div class="card-title"><i class="fa-solid fa-paper-plane"></i> Linked Outward Letters (<?= count($linkedOuts) ?>)</div>
-        <div class="links-grid">
-            <?php foreach ($linkedOuts as $o): ?>
-            <a href="unified_details.php?type=outward&id=<?= (int)$o['id'] ?>" class="link-item">
-                <div class="icon"><i class="fa-solid fa-paper-plane"></i></div>
-                <div class="body">
-                    <div class="ref"><?= htmlspecialchars($o['letter_ref']) ?></div>
-                    <div class="ttl"><?= htmlspecialchars(mb_substr($o['title'], 0, 55)) ?></div>
-                </div>
-                <div class="arr"><i class="fa-solid fa-chevron-right"></i></div>
-            </a>
-            <?php endforeach; ?>
-        </div>
-    </div>
-    <?php endif; ?>
-
-    <?php if (!empty($mainRecord['attachment'])): ?>
-    <div class="card">
-        <div class="card-title"><i class="fa-solid fa-paperclip"></i> Original Attachment</div>
-        <a href="../../uploads/letters/<?= htmlspecialchars($mainRecord['attachment']) ?>" target="_blank" class="link-item" style="max-width:400px;">
-            <div class="icon"><i class="fa-solid fa-file-pdf"></i></div>
-            <div class="body">
-                <div class="ref">View Original PDF</div>
-                <div class="ttl"><?= htmlspecialchars($mainRecord['attachment']) ?></div>
-            </div>
-            <div class="arr"><i class="fa-solid fa-arrow-up-right-from-square"></i></div>
-        </a>
-    </div>
-    <?php endif; ?>
-
-    <?php endif; ?>
-
-    <!-- ═══════════════ TASK LETTER DETAILS ═══════════════ -->
-    <?php if ($type === 'task'): ?>
+    <?php elseif ($type === 'task'): ?>
 
     <div class="card">
         <div class="card-title"><i class="fa-solid fa-circle-info"></i> Task Information</div>
@@ -944,74 +978,6 @@ body {
         <?php endif; ?>
     </div>
 
-    <div class="card">
-        <div class="card-title"><i class="fa-solid fa-reply-all"></i> Replies Received (<?= count($replies) ?>)</div>
-        <?php if (!empty($replies)): ?>
-        <div class="table-wrap">
-            <table class="tbl">
-                <thead><tr><th>Regiment</th><th>Reply Letter</th><th>Status</th><th>Replied By</th><th>Date</th></tr></thead>
-                <tbody>
-                    <?php foreach ($replies as $r): ?>
-                    <tr>
-                        <td><strong><?= htmlspecialchars($r['regiment_name'] ?? '') ?></strong></td>
-                        <td>
-                            <?php if (!empty($r['internal_letter_id'])): ?>
-                                <a href="unified_details.php?type=internal&id=<?= (int)$r['internal_letter_id'] ?>" style="color:var(--accent);text-decoration:none;">
-                                    <?= htmlspecialchars($r['cdr_number'] ?? '') ?> — <?= htmlspecialchars($r['letter_reference'] ?? '') ?>
-                                </a>
-                            <?php else: ?>
-                                <em style="color:var(--muted);">Data NIL</em>
-                            <?php endif; ?>
-                        </td>
-                        <td><span class="badge b-status-<?= ($r['reply_status'] ?? '') === 'Accepted' ? 'Completed' : 'Pending' ?>"><?= htmlspecialchars($r['reply_status'] ?? '') ?></span></td>
-                        <td><?= !empty($r['replied_by_name']) ? htmlspecialchars(trim(($r['replied_by_rank'] ?? '').' '.$r['replied_by_name'])) : '—' ?></td>
-                        <td><?= !empty($r['replied_at']) ? date('d M Y H:i', strtotime($r['replied_at'])) : '—' ?></td>
-                    </tr>
-                    <?php endforeach; ?>
-                </tbody>
-            </table>
-        </div>
-        <?php else: ?>
-        <div class="empty"><i class="fa-solid fa-inbox"></i>No replies received yet</div>
-        <?php endif; ?>
-    </div>
-
-    <?php if (!empty($taskSources)): ?>
-    <div class="card">
-        <div class="card-title"><i class="fa-solid fa-envelope-open-text"></i> Source Internal Letters (<?= count($taskSources) ?>)</div>
-        <div class="links-grid">
-            <?php foreach ($taskSources as $il): ?>
-            <a href="unified_details.php?type=internal&id=<?= (int)$il['id'] ?>" class="link-item">
-                <div class="icon"><i class="fa-solid fa-envelope-open-text"></i></div>
-                <div class="body">
-                    <div class="ref"><?= htmlspecialchars($il['cdr_number'] ?? '') ?></div>
-                    <div class="ttl"><?= htmlspecialchars(mb_substr($il['letter_title'] ?? '', 0, 55)) ?></div>
-                </div>
-                <div class="arr"><i class="fa-solid fa-chevron-right"></i></div>
-            </a>
-            <?php endforeach; ?>
-        </div>
-    </div>
-    <?php endif; ?>
-
-    <?php if (!empty($taskOuts)): ?>
-    <div class="card">
-        <div class="card-title"><i class="fa-solid fa-paper-plane"></i> Linked Outward Letters (<?= count($taskOuts) ?>)</div>
-        <div class="links-grid">
-            <?php foreach ($taskOuts as $o): ?>
-            <a href="unified_details.php?type=outward&id=<?= (int)$o['id'] ?>" class="link-item">
-                <div class="icon"><i class="fa-solid fa-paper-plane"></i></div>
-                <div class="body">
-                    <div class="ref"><?= htmlspecialchars($o['letter_ref'] ?? '') ?></div>
-                    <div class="ttl"><?= htmlspecialchars(mb_substr($o['title'] ?? '', 0, 55)) ?></div>
-                </div>
-                <div class="arr"><i class="fa-solid fa-chevron-right"></i></div>
-            </a>
-            <?php endforeach; ?>
-        </div>
-    </div>
-    <?php endif; ?>
-
     <?php if (!empty($mainRecord['file_path'])): ?>
     <div class="card">
         <div class="card-title"><i class="fa-solid fa-paperclip"></i> Attachment</div>
@@ -1026,10 +992,7 @@ body {
     </div>
     <?php endif; ?>
 
-    <?php endif; ?>
-
-    <!-- ═══════════════ OUTWARD LETTER DETAILS ═══════════════ -->
-    <?php if ($type === 'outward'): ?>
+    <?php else: /* OUTWARD */ ?>
 
     <div class="card">
         <div class="card-title"><i class="fa-solid fa-circle-info"></i> Letter Information</div>
@@ -1103,24 +1066,6 @@ body {
     </div>
     <?php endif; ?>
 
-    <?php if (!empty($linkedInternals)): ?>
-    <div class="card">
-        <div class="card-title"><i class="fa-solid fa-envelope-open-text"></i> Source Internal Letters (<?= count($linkedInternals) ?>)</div>
-        <div class="links-grid">
-            <?php foreach ($linkedInternals as $il): ?>
-            <a href="unified_details.php?type=internal&id=<?= (int)$il['id'] ?>" class="link-item">
-                <div class="icon"><i class="fa-solid fa-envelope-open-text"></i></div>
-                <div class="body">
-                    <div class="ref"><?= htmlspecialchars($il['cdr_number'] ?? '') ?></div>
-                    <div class="ttl"><?= htmlspecialchars(mb_substr($il['letter_title'] ?? '', 0, 55)) ?></div>
-                </div>
-                <div class="arr"><i class="fa-solid fa-chevron-right"></i></div>
-            </a>
-            <?php endforeach; ?>
-        </div>
-    </div>
-    <?php endif; ?>
-
     <?php if (!empty($mainRecord['file_path'])): ?>
     <div class="card">
         <div class="card-title"><i class="fa-solid fa-paperclip"></i> Attachment</div>
@@ -1137,31 +1082,263 @@ body {
 
     <?php endif; ?>
 
+    <!-- ═══════════════════════════════════════════════════════
+         SECTION 2 — SOURCE DOCUMENTS
+         (For Task/Outward main only; Internal is itself the source)
+         ═══════════════════════════════════════════════════════ -->
+    <?php if ($type === 'task'): ?>
+        <?php if (!empty($taskSources)): ?>
+        <div class="section-banner sb-source">
+            <div class="num">2</div>
+            <i class="fa-solid fa-book-bookmark"></i>
+            <span>Source Documents</span>
+            <span class="cnt"><?= count($taskSources) ?></span>
+        </div>
+        <div class="card">
+            <div class="card-title"><i class="fa-solid fa-envelope-open-text"></i> Source Internal Letters</div>
+            <div class="links-grid">
+                <?php foreach ($taskSources as $il): ?>
+                <a href="unified_details.php?type=internal&id=<?= (int)$il['id'] ?>" class="link-item">
+                    <div class="icon"><i class="fa-solid fa-envelope-open-text"></i></div>
+                    <div class="body">
+                        <div class="ref"><?= htmlspecialchars($il['cdr_number'] ?? '') ?></div>
+                        <div class="ttl"><?= htmlspecialchars(mb_substr($il['letter_title'] ?? '', 0, 55)) ?></div>
+                    </div>
+                    <div class="arr"><i class="fa-solid fa-chevron-right"></i></div>
+                </a>
+                <?php endforeach; ?>
+            </div>
+        </div>
+        <?php endif; ?>
+
+    <?php elseif ($type === 'outward'): ?>
+        <?php if (!empty($linkedInternals)): ?>
+        <div class="section-banner sb-source">
+            <div class="num">2</div>
+            <i class="fa-solid fa-book-bookmark"></i>
+            <span>Source Documents</span>
+            <span class="cnt"><?= count($linkedInternals) ?></span>
+        </div>
+        <div class="card">
+            <div class="card-title"><i class="fa-solid fa-envelope-open-text"></i> Source Internal Letters</div>
+            <div class="links-grid">
+                <?php foreach ($linkedInternals as $il): ?>
+                <a href="unified_details.php?type=internal&id=<?= (int)$il['id'] ?>" class="link-item">
+                    <div class="icon"><i class="fa-solid fa-envelope-open-text"></i></div>
+                    <div class="body">
+                        <div class="ref"><?= htmlspecialchars($il['cdr_number'] ?? '') ?></div>
+                        <div class="ttl"><?= htmlspecialchars(mb_substr($il['letter_title'] ?? '', 0, 55)) ?></div>
+                    </div>
+                    <div class="arr"><i class="fa-solid fa-chevron-right"></i></div>
+                </a>
+                <?php endforeach; ?>
+            </div>
+        </div>
+        <?php endif; ?>
+
+    <?php endif; ?>
+
+    <!-- ═══════════════════════════════════════════════════════
+         SECTION 3 — TASK DOCUMENTS
+         ═══════════════════════════════════════════════════════ -->
+    <?php if ($type === 'internal'): ?>
+        <?php if (!empty($linkedTasks)): ?>
+        <div class="section-banner sb-task">
+            <div class="num">3</div>
+            <i class="fa-solid fa-list-check"></i>
+            <span>Task Documents</span>
+            <span class="cnt"><?= count($linkedTasks) ?></span>
+        </div>
+        <div class="card">
+            <div class="card-title"><i class="fa-solid fa-list-check"></i> Linked Task Letters</div>
+            <div class="links-grid">
+                <?php foreach ($linkedTasks as $t): ?>
+                <a href="unified_details.php?type=task&id=<?= (int)$t['id'] ?>" class="link-item">
+                    <div class="icon"><i class="fa-solid fa-list-check"></i></div>
+                    <div class="body">
+                        <div class="ref"><?= htmlspecialchars($t['tsk_cdr_number']) ?></div>
+                        <div class="ttl"><?= htmlspecialchars(mb_substr($t['title'], 0, 55)) ?></div>
+                    </div>
+                    <div class="arr"><i class="fa-solid fa-chevron-right"></i></div>
+                </a>
+                <?php endforeach; ?>
+            </div>
+        </div>
+        <?php endif; ?>
+
+        <?php if (!empty($linkedOuts)): ?>
+        <div class="card">
+            <div class="card-title"><i class="fa-solid fa-paper-plane"></i> Linked Outward Letters (<?= count($linkedOuts) ?>)</div>
+            <div class="links-grid">
+                <?php foreach ($linkedOuts as $o): ?>
+                <a href="unified_details.php?type=outward&id=<?= (int)$o['id'] ?>" class="link-item">
+                    <div class="icon"><i class="fa-solid fa-paper-plane"></i></div>
+                    <div class="body">
+                        <div class="ref"><?= htmlspecialchars($o['letter_ref']) ?></div>
+                        <div class="ttl"><?= htmlspecialchars(mb_substr($o['title'], 0, 55)) ?></div>
+                    </div>
+                    <div class="arr"><i class="fa-solid fa-chevron-right"></i></div>
+                </a>
+                <?php endforeach; ?>
+            </div>
+        </div>
+        <?php endif; ?>
+
+    <?php elseif ($type === 'outward'): ?>
+        <?php if (!empty($linkedTasksFromOutward)): ?>
+        <div class="section-banner sb-task">
+            <div class="num">3</div>
+            <i class="fa-solid fa-list-check"></i>
+            <span>Task Documents</span>
+            <span class="cnt"><?= count($linkedTasksFromOutward) ?></span>
+        </div>
+        <div class="card">
+            <div class="card-title"><i class="fa-solid fa-list-check"></i> Linked Task Letters</div>
+            <div class="links-grid">
+                <?php foreach ($linkedTasksFromOutward as $t): ?>
+                <a href="unified_details.php?type=task&id=<?= (int)$t['id'] ?>" class="link-item">
+                    <div class="icon"><i class="fa-solid fa-list-check"></i></div>
+                    <div class="body">
+                        <div class="ref"><?= htmlspecialchars($t['tsk_cdr_number'] ?? '') ?></div>
+                        <div class="ttl"><?= htmlspecialchars(mb_substr($t['title'] ?? '', 0, 55)) ?></div>
+                    </div>
+                    <div class="arr"><i class="fa-solid fa-chevron-right"></i></div>
+                </a>
+                <?php endforeach; ?>
+            </div>
+        </div>
+        <?php endif; ?>
+
+    <?php elseif ($type === 'task'): ?>
+        <?php if (!empty($taskOuts)): ?>
+        <div class="section-banner sb-task">
+            <div class="num">3</div>
+            <i class="fa-solid fa-paper-plane"></i>
+            <span>Task Documents</span>
+            <span class="cnt"><?= count($taskOuts) ?></span>
+        </div>
+        <div class="card">
+            <div class="card-title"><i class="fa-solid fa-paper-plane"></i> Linked Outward Letters</div>
+            <div class="links-grid">
+                <?php foreach ($taskOuts as $o): ?>
+                <a href="unified_details.php?type=outward&id=<?= (int)$o['id'] ?>" class="link-item">
+                    <div class="icon"><i class="fa-solid fa-paper-plane"></i></div>
+                    <div class="body">
+                        <div class="ref"><?= htmlspecialchars($o['letter_ref'] ?? '') ?></div>
+                        <div class="ttl"><?= htmlspecialchars(mb_substr($o['title'] ?? '', 0, 55)) ?></div>
+                    </div>
+                    <div class="arr"><i class="fa-solid fa-chevron-right"></i></div>
+                </a>
+                <?php endforeach; ?>
+            </div>
+        </div>
+        <?php endif; ?>
+    <?php endif; ?>
+
+    <!-- ═══════════════════════════════════════════════════════
+         SECTION 4 — REPLY DOCUMENTS
+         ═══════════════════════════════════════════════════════ -->
+    <?php if (!empty($replyDocs)): ?>
+        <div class="section-banner sb-reply">
+            <div class="num">4</div>
+            <i class="fa-solid fa-reply-all"></i>
+            <span>Reply Documents</span>
+            <span class="cnt"><?= count($replyDocs) ?></span>
+        </div>
+
+        <div class="card">
+            <div class="card-title"><i class="fa-solid fa-reply-all"></i> Replies Received (<?= count($replyDocs) ?>)</div>
+            <div class="table-wrap">
+                <table class="tbl">
+                    <thead>
+                        <tr>
+                            <th>Regiment</th>
+                            <th>Reply Letter</th>
+                            <th>For Task</th>
+                            <th>Status</th>
+                            <th>Replied At</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ($replyDocs as $r): ?>
+                        <tr>
+                            <td><strong><?= htmlspecialchars($r['regiment_name'] ?? '—') ?></strong></td>
+                            <td>
+                                <?php if (!empty($r['internal_letter_id'])): ?>
+                                    <a href="unified_details.php?type=internal&id=<?= (int)$r['internal_letter_id'] ?>" style="color:var(--accent);text-decoration:none;font-weight:600;">
+                                        <?= htmlspecialchars($r['cdr_number'] ?? '') ?>
+                                        <?php if (!empty($r['letter_reference'])): ?>
+                                            — <?= htmlspecialchars($r['letter_reference']) ?>
+                                        <?php endif; ?>
+                                    </a>
+                                    <?php if (!empty($r['letter_title'])): ?>
+                                        <div style="font-size:0.76rem;color:var(--muted);margin-top:2px;">
+                                            <?= htmlspecialchars(mb_substr($r['letter_title'], 0, 70)) ?>
+                                        </div>
+                                    <?php endif; ?>
+                                <?php else: ?>
+                                    <em style="color:var(--muted);">Data NIL</em>
+                                <?php endif; ?>
+                            </td>
+                            <td>
+                                <?php if (!empty($r['task_id'])): ?>
+                                    <a href="unified_details.php?type=task&id=<?= (int)$r['task_id'] ?>" style="color:var(--accent);text-decoration:none;">
+                                        <?= htmlspecialchars($r['tsk_cdr_number'] ?? '—') ?>
+                                    </a>
+                                    <?php if (!empty($r['task_title'])): ?>
+                                        <div style="font-size:0.76rem;color:var(--muted);margin-top:2px;">
+                                            <?= htmlspecialchars(mb_substr($r['task_title'], 0, 60)) ?>
+                                        </div>
+                                    <?php endif; ?>
+                                <?php else: ?>
+                                    —
+                                <?php endif; ?>
+                            </td>
+                            <td>
+                                <span class="badge b-status-<?= ($r['reply_status'] ?? '') === 'Accepted' ? 'Completed' : 'Pending' ?>">
+                                    <?= htmlspecialchars($r['reply_status'] ?? '—') ?>
+                                </span>
+                            </td>
+                            <td>
+                                <?= !empty($r['replied_at']) ? date('d M Y H:i', strtotime($r['replied_at'])) : '—' ?>
+                            </td>
+                        </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    <?php endif; ?>
+
+    <?php if ($type === 'internal' && !empty($mainRecord['attachment'])): ?>
+    <div class="card">
+        <div class="card-title"><i class="fa-solid fa-paperclip"></i> Original Attachment</div>
+        <a href="../../uploads/letters/<?= htmlspecialchars($mainRecord['attachment']) ?>" target="_blank" class="link-item" style="max-width:400px;">
+            <div class="icon"><i class="fa-solid fa-file-pdf"></i></div>
+            <div class="body">
+                <div class="ref">View Original PDF</div>
+                <div class="ttl"><?= htmlspecialchars($mainRecord['attachment']) ?></div>
+            </div>
+            <div class="arr"><i class="fa-solid fa-arrow-up-right-from-square"></i></div>
+        </a>
+    </div>
+    <?php endif; ?>
+
 </main>
 
 <script>
-// ═══════════════════════════════════════════════════════════
-// THEME
-// ═══════════════════════════════════════════════════════════
 (function() {
     const t = localStorage.getItem('dispatch_theme') || 'dark';
     document.documentElement.setAttribute('data-theme', t);
 })();
 
-// ═══════════════════════════════════════════════════════════
-// SIDEBAR SUBMENU TOGGLE
-// ═══════════════════════════════════════════════════════════
 document.querySelectorAll('.nav-toggle').forEach(function(btn) {
     btn.addEventListener('click', function(e) {
         e.preventDefault();
         const targetId = this.dataset.target;
         const sub = document.getElementById(targetId);
         if (!sub) return;
-
-        // Toggle open class
         sub.classList.toggle('open');
-
-        // Rotate chevron
         const chevron = this.querySelector('.chevron');
         if (chevron) {
             chevron.style.transform = sub.classList.contains('open') ? 'rotate(180deg)' : 'rotate(0deg)';

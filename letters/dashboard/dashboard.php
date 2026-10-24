@@ -903,19 +903,19 @@ if ($userDeskId > 0) {
         <!-- Internal Letters -->
         <div>
             <div class="nav-btn <?= $grp['internal'] ? '' : 'disabled' ?>" <?= $grp['internal'] ? 'onclick="toggleSubmenu(\'internalSub\')"' : '' ?>>
-                <i class="fa-solid fa-envelope-open-text"></i> Internal Letters
+                <i class="fa-solid fa-envelope-open-text"></i> Inward Letters
                 <i class="fa-solid fa-chevron-down chevron"></i>
             </div>
             <div id="internalSub" class="submenu">
-                <a href="../../letters/inward/add_internal_letter.php" class="sub-nav-btn <?= $perm['internal_add'] ? '' : 'disabled' ?>">Add Internal</a>
-                <a href="../../letters/inward/internal_letters.php" class="sub-nav-btn <?= $perm['internal_view'] ? '' : 'disabled' ?>">View Internal</a>
+                <a href="../../letters/inward/add_internal_letter.php" class="sub-nav-btn <?= $perm['internal_add'] ? '' : 'disabled' ?>">Add Inward</a>
+                <a href="../../letters/inward/internal_letters.php" class="sub-nav-btn <?= $perm['internal_view'] ? '' : 'disabled' ?>">View Inward</a>
             </div>
         </div>
 
         <!-- External Letters -->
         <div>
             <div class="nav-btn <?= $grp['external'] ? '' : 'disabled' ?>" <?= $grp['external'] ? 'onclick="toggleSubmenu(\'extranalSub\')"' : '' ?>>
-                <i class="fa-solid fa-paper-plane"></i> External Letters
+                <i class="fa-solid fa-paper-plane"></i> Outward Letters
                 <i class="fa-solid fa-chevron-down chevron"></i>
             </div>
             <div id="extranalSub" class="submenu">
@@ -943,7 +943,7 @@ if ($userDeskId > 0) {
                <i class="fa-solid fa-chevron-down chevron"></i>
             </div>
             <div id="inboxSub" class="submenu">
-                <a href="../../letters/inward/inbox.php" class="sub-nav-btn <?= $perm['inbox_internal'] ? '' : 'disabled' ?>">Internal Inbox</a>
+                <a href="../../letters/inward/inbox.php" class="sub-nav-btn <?= $perm['inbox_internal'] ? '' : 'disabled' ?>">Inward Inbox</a>
                 <a href="../../letters/Final_Disposal/final_disposal_inbox.php" class="sub-nav-btn <?= $perm['inbox_disposal'] ? '' : 'disabled' ?>">Disposal Inbox</a>
             </div>
         </div>
@@ -985,6 +985,20 @@ if ($userDeskId > 0) {
             </div>
         </div>
       
+        <!-- ══════════ MODULES ══════════ -->
+        <div class="nav-group-label">MODULES</div>
+
+        <!-- PDF CONVERTER -->
+        <div>
+            <div class="nav-btn <?= $grp['category'] ? '' : 'disabled' ?>" <?= $grp['category'] ? 'onclick="toggleSubmenu(\'PDFcon\')"' : '' ?>>
+                <i class="fa-solid fa-file-pdf"></i> PDF Converter
+                <i class="fa-solid fa-chevron-down chevron"></i>
+            </div>
+            <div id="PDFcon" class="submenu">
+                <a href="../../modules/pdf_extract.php" class="sub-nav-btn <?= $perm['cat_add'] ? '' : 'disabled' ?>">PDF to TEXT</a>
+            </div>    
+        </div>
+        
         <!-- ══════════ SYSTEM MANAGEMENT ══════════ -->
         <div class="nav-group-label">System Management</div>
 
@@ -998,7 +1012,8 @@ if ($userDeskId > 0) {
                 <a href="../../admin/category/category.php" class="sub-nav-btn <?= $perm['cat_add'] ? '' : 'disabled' ?>">Add Categories</a>
             </div>    
         </div>
-        
+
+
         <!-- System Permission -->
         <div>
             <div class="nav-btn <?= $grp['permission'] ? '' : 'disabled' ?>" <?= $grp['permission'] ? 'onclick="toggleSubmenu(\'permissionSub\')"' : '' ?>>
@@ -1231,15 +1246,15 @@ if ($userDeskId > 0) {
                 <h2 class="metric-value" style="color: #ff051a;"><?= $pendingCount ?></h2>
             </div>
             <div class="metric-box">
-                <span class="metric-title">All Letters (Internal<br>| Extranal | Tasked)</span>
+                <span class="metric-title">All Letters (Inward<br>| Outward | Tasked)</span>
                 <h2 class="metric-value"><?= $allLettersCount ?></h2>
             </div>
             <div class="metric-box">
-                <span class="metric-title">Internal (Total Inward letters) </span>
+                <span class="metric-title">Inward (Total Inward letters) </span>
                 <h2 class="metric-value" style="color: #f80808;"><?= $internalCount ?></h2>
             </div>
             <div class="metric-box">
-                <span class="metric-title">External  (Total outward letters)</span>
+                <span class="metric-title">Outward  (Total outward letters)</span>
                 <h2 class="metric-value" style="color: #d2ff0a;"><?= $externalCount ?></h2>
             </div>
             <div class="metric-box">

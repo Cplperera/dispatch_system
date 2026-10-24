@@ -2,6 +2,12 @@
 /**
  * PRINT DOSSIER — rendered by headless Chrome, one part at a time
  * ?token=...&part=cover|index|doc&idx=N
+ *
+ * CHAIN SECTIONS (mirrors generate_full_dossier.php):
+ *   1. main    — Main Document
+ *   2. source  — Source Documents
+ *   3. task    — Task Documents
+ *   4. reply   — Reply Documents
  */
 
 require_once '../../config/db.php';
@@ -60,10 +66,6 @@ function fetchForwardingHistory($conn, $letterId) {
     $s = $conn->prepare("SELECT f.comments, f.forwarded_at, f.seen, u1.name_with_initial AS to_user, u1.rank AS to_rank, u2.name_with_initial AS by_user, u2.rank AS by_rank FROM internal_letters_forwarding f LEFT JOIN users u1 ON f.forwarded_to = u1.id LEFT JOIN users u2 ON f.forwarded_by = u2.id WHERE f.letter_id = ? ORDER BY f.forwarded_at ASC");
     $s->bind_param("i", $letterId); $s->execute(); return $s->get_result()->fetch_all(MYSQLI_ASSOC);
 }
-function fetchOutwardForInternal($conn, $internalId) {
-    $s = $conn->prepare("SELECT o.id FROM outward_letters o JOIN outward_internal oi ON o.id = oi.outward_id WHERE oi.internal_id = ? AND o.is_deleted = 0");
-    $s->bind_param("i", $internalId); $s->execute(); return array_column($s->get_result()->fetch_all(MYSQLI_ASSOC), 'id');
-}
 function fetchDisposalForInternal($conn, $internalId) {
     $s = $conn->prepare("SELECT d.remarks, d.status, d.forwarded_at, ds.desk_name, u.name_with_initial AS by_user, u.rank AS by_rank FROM internal_letters_final_disposal d LEFT JOIN desks ds ON d.forwarded_to = ds.id LEFT JOIN users u ON d.forwarded_by = u.id WHERE d.letter_id = ? ORDER BY d.forwarded_at ASC");
     $s->bind_param("i", $internalId); $s->execute(); return $s->get_result()->fetch_all(MYSQLI_ASSOC);
@@ -96,76 +98,128 @@ function fetchInternalLinkedToOutward($conn, $outwardId) {
     $s = $conn->prepare("SELECT DISTINCT il.id FROM internal_letters il JOIN outward_internal oi ON il.id = oi.internal_id WHERE oi.outward_id = ? AND il.is_deleted = 0");
     $s->bind_param("i", $outwardId); $s->execute(); return array_column($s->get_result()->fetch_all(MYSQLI_ASSOC), 'id');
 }
+function fetchTasksLinkedToOutward($conn, $outwardId) {
+    $s = $conn->prepare("SELECT DISTINCT tl.id FROM task_letters tl JOIN outward_task ot ON tl.id = ot.task_id WHERE ot.outward_id = ?");
+    $s->bind_param("i", $outwardId); $s->execute(); return array_column($s->get_result()->fetch_all(MYSQLI_ASSOC), 'id');
+}
 
 // ═══════════════════════════════════════════════════════════
-// BUILD CHAIN
+// BUILD CHAIN — SECTIONED (main → source → task → reply)
 // ═══════════════════════════════════════════════════════════
-$mainInternal = null; $mainTask = null; $mainOutward = null;
-$chain = []; $visited = [];
+$mainInternal = $type === 'internal' ? fetchInternal($conn, $id) : null;
+$mainTask     = $type === 'task'     ? fetchTask($conn, $id)     : null;
+$mainOutward  = $type === 'outward'  ? fetchOutward($conn, $id)  : null;
+$mainRec      = $mainInternal ?: $mainTask ?: $mainOutward;
+if (!$mainRec) { http_response_code(404); exit('Not found'); }
 
-if ($type === 'internal') {
-    $mainInternal = fetchInternal($conn, $id);
-    if (!$mainInternal) { http_response_code(404); exit('Not found'); }
-    $chain[] = ['type'=>'internal','id'=>$id,'label'=>'MAIN LETTER'];
-    $visited["internal_$id"] = true;
-    foreach (fetchTasksLinkedToInternal($conn, $id) as $tid) {
-        if (!isset($visited["task_$tid"])) { $visited["task_$tid"] = true; $chain[] = ['type'=>'task','id'=>$tid,'label'=>'LINKED TASK']; }
-    }
-    foreach (fetchOutwardForInternal($conn, $id) as $oid) {
-        if (!isset($visited["outward_$oid"])) { $visited["outward_$oid"] = true; $chain[] = ['type'=>'outward','id'=>$oid,'label'=>'REPORT OUT']; }
-    }
-} elseif ($type === 'task') {
-    $mainTask = fetchTask($conn, $id);
-    if (!$mainTask) { http_response_code(404); exit('Not found'); }
-    $chain[] = ['type'=>'task','id'=>$id,'label'=>'MAIN TASK'];
-    $visited["task_$id"] = true;
-    foreach (fetchInternalLinksForTask($conn, $id) as $iid) {
-        if (!isset($visited["internal_$iid"])) { $visited["internal_$iid"] = true; $chain[] = ['type'=>'internal','id'=>$iid,'label'=>'SOURCE LETTER']; }
-    }
-    foreach (fetchRepliesForTask($conn, $id) as $r) {
-        if (!empty($r['internal_letter_id']) && !isset($visited["internal_{$r['internal_letter_id']}"])) {
-            $visited["internal_{$r['internal_letter_id']}"] = true;
-            $chain[] = ['type'=>'internal','id'=>$r['internal_letter_id'],'label'=>'TASK REPLY'];
+$chain   = [];
+$visited = [];
+
+$add = function($t, $i, $section) use (&$chain, &$visited) {
+    $key = "{$t}_{$i}";
+    if (isset($visited[$key])) return;
+    $visited[$key] = true;
+    $chain[] = ['type' => $t, 'id' => (int)$i, 'section' => $section];
+};
+
+// ─── PRE-COMPUTE: which internals are REPLIES ───
+// (prevents reply letters from being mis-categorized as "source")
+$replyInternalIds = [];
+
+$taskIdsToScan = [];
+if ($type === 'task') {
+    $taskIdsToScan[] = $id;
+} elseif ($type === 'internal') {
+    $taskIdsToScan = fetchTasksLinkedToInternal($conn, $id);
+} elseif ($type === 'outward') {
+    $taskIdsToScan = fetchTasksLinkedToOutward($conn, $id);
+}
+
+foreach ($taskIdsToScan as $tid) {
+    foreach (fetchRepliesForTask($conn, $tid) as $r) {
+        if (!empty($r['internal_letter_id'])) {
+            $replyInternalIds[(int)$r['internal_letter_id']] = true;
         }
     }
-    foreach (fetchOutwardLinkedToTask($conn, $id) as $oid) {
-        if (!isset($visited["outward_$oid"])) { $visited["outward_$oid"] = true; $chain[] = ['type'=>'outward','id'=>$oid,'label'=>'LINKED OUTWARD']; }
+}
+
+// ─── 1. MAIN ───
+$add($type, $id, 'main');
+
+// ─── 2. SOURCE (exclude replies) ───
+if ($type === 'task') {
+    foreach (fetchInternalLinksForTask($conn, $id) as $iid) {
+        if (isset($replyInternalIds[(int)$iid])) continue;   // ← KEY FIX
+        $add('internal', $iid, 'source');
     }
-} else {
-    $mainOutward = fetchOutward($conn, $id);
-    if (!$mainOutward) { http_response_code(404); exit('Not found'); }
-    $chain[] = ['type'=>'outward','id'=>$id,'label'=>'MAIN OUTWARD'];
-    $visited["outward_$id"] = true;
+} elseif ($type === 'outward') {
     foreach (fetchInternalLinkedToOutward($conn, $id) as $iid) {
-        if (!isset($visited["internal_$iid"])) { $visited["internal_$iid"] = true; $chain[] = ['type'=>'internal','id'=>$iid,'label'=>'SOURCE INTERNAL']; }
+        if (isset($replyInternalIds[(int)$iid])) continue;   // ← KEY FIX
+        $add('internal', $iid, 'source');
     }
 }
+
+// ─── 3. TASK ───
+if ($type === 'internal') {
+    foreach (fetchTasksLinkedToInternal($conn, $id) as $tid) $add('task', $tid, 'task');
+} elseif ($type === 'outward') {
+    foreach (fetchTasksLinkedToOutward($conn, $id) as $tid) $add('task', $tid, 'task');
+}
+
+// ─── 4. REPLY ───
+$taskIdsInChain = [];
+foreach ($chain as $c) if ($c['type'] === 'task') $taskIdsInChain[] = (int)$c['id'];
+
+foreach ($taskIdsInChain as $tid) {
+    foreach (fetchRepliesForTask($conn, $tid) as $r) {
+        if (!empty($r['internal_letter_id'])) {
+            $add('internal', (int)$r['internal_letter_id'], 'reply');
+        }
+    }
+}
+
 if (count($chain) > 30) $chain = array_slice($chain, 0, 30);
 
-if ($scope === 'main') $chain = [$chain[0]];
-elseif ($scope === 'internal') $chain = array_values(array_filter($chain, fn($c)=>$c['type']==='internal'));
-elseif ($scope === 'task')     $chain = array_values(array_filter($chain, fn($c)=>$c['type']==='task'));
-elseif ($scope === 'outward')  $chain = array_values(array_filter($chain, fn($c)=>$c['type']==='outward'));
-if (empty($chain)) $chain = [['type'=>$type,'id'=>$id,'label'=>'MAIN DOCUMENT']];
+// Scope filters (preserve section order)
+if ($scope === 'main') {
+    $chain = [$chain[0]];
+} elseif ($scope === 'internal') {
+    $chain = array_values(array_filter($chain, fn($c) => $c['type'] === 'internal'));
+} elseif ($scope === 'task') {
+    $chain = array_values(array_filter($chain, fn($c) => $c['type'] === 'task'));
+} elseif ($scope === 'outward') {
+    $chain = array_values(array_filter($chain, fn($c) => $c['type'] === 'outward'));
+}
+if (empty($chain)) $chain = [['type'=>$type, 'id'=>$id, 'section'=>'main']];
 
 $mainRef   = $type === 'internal' ? $mainInternal['cdr_number'] : ($type === 'task' ? $mainTask['tsk_cdr_number'] : $mainOutward['letter_ref']);
 $mainTitle = $mainInternal['letter_title'] ?? $mainTask['title'] ?? $mainOutward['title'] ?? 'N/A';
 $mainDate  = $mainInternal['letter_date'] ?? $mainTask['letter_date'] ?? $mainOutward['letter_date'];
 
-$counts = ['internal'=>0,'task'=>0,'outward'=>0];
-foreach ($chain as $c) $counts[$c['type']]++;
+// Counts: by type and by section
+$counts         = ['internal'=>0, 'task'=>0, 'outward'=>0];
+$sectionCounts  = ['main'=>0, 'source'=>0, 'task'=>0, 'reply'=>0];
+foreach ($chain as $c) {
+    $counts[$c['type']]++;
+    if (isset($sectionCounts[$c['section']])) $sectionCounts[$c['section']]++;
+}
 
 // ⚠️ National Emblem path (must exist!)
 $emblemUrl = '../../assets/images/sl_emblem.png';
+
+// Friendly names
+$sectionLabel = [
+    'main'   => 'MAIN DOCUMENT',
+    'source' => 'SOURCE DOCUMENT',
+    'task'   => 'TASK DOCUMENT',
+    'reply'  => 'REPLY DOCUMENT',
+];
 ?>
 <!DOCTYPE html>
 <html lang="si">
 <head>
 <meta charset="UTF-8">
 <title>Dossier — <?= htmlspecialchars($mainRef) ?></title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Sinhala:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
 @page { size: A4; margin: 14mm 12mm; }
 * { box-sizing: border-box; }
@@ -180,7 +234,6 @@ html, body {
 /* ═══════════════ COVER ═══════════════ */
 .cover { height: calc(297mm - 28mm); display: flex; flex-direction: column; }
 
-/* ⚠️ NEW — National Emblem of Sri Lanka */
 .cover-emblem-wrap {
     text-align: center;
     padding: 18px 0 10px;
@@ -205,7 +258,7 @@ html, body {
 .cover-date { font-size: 10.5pt; color: #707EAE; margin-bottom: 34px; }
 .cover-contents {
     border: 2px solid #DDE2EF; border-radius: 10px; padding: 20px;
-    max-width: 380px; margin: 0 auto;
+    max-width: 420px; margin: 0 auto;
 }
 .cover-contents h3 {
     font-size: 9pt; letter-spacing: 2px; text-transform: uppercase;
@@ -214,6 +267,13 @@ html, body {
 .cover-contents .count { font-size: 30pt; font-weight: 800; color: #4318FF; line-height: 1; }
 .cover-contents .label { font-size: 8.5pt; color: #707EAE; text-transform: uppercase; letter-spacing: 1.5px; }
 .cover-meta { margin-top: 13px; font-size: 10pt; color: #556080; }
+.cover-sections {
+    display: flex; justify-content: space-around; gap: 8px;
+    margin-top: 14px; padding-top: 12px; border-top: 1px dashed #DDE2EF;
+}
+.cover-sections .sec { text-align: center; flex: 1; }
+.cover-sections .sec .n { font-size: 14pt; font-weight: 800; color: #29417A; line-height: 1.1; }
+.cover-sections .sec .l { font-size: 7.5pt; color: #707EAE; text-transform: uppercase; letter-spacing: 0.8px; margin-top: 2px; }
 .cover-footer { padding: 15px 40px; text-align: center; font-size: 8pt; color: #707EAE; border-top: 1px solid #DDE2EF; }
 .cover-classification { font-weight: 800; color: #cd0505; letter-spacing: 2px; margin-top: 5px; }
 
@@ -222,13 +282,22 @@ html, body {
     font-size: 18pt; color: #29417A; border-bottom: 3px solid #4318FF;
     padding-bottom: 8px; margin: 0 0 20px; text-transform: uppercase; letter-spacing: 1px;
 }
-table.index-tbl { width: 100%; border-collapse: collapse; font-size: 9.5pt; }
+table.index-tbl { width: 100%; border-collapse: collapse; font-size: 9pt; }
 table.index-tbl th {
-    background: #29417A; color: #fff; padding: 9px 10px; text-align: left;
-    font-size: 8.5pt; text-transform: uppercase; letter-spacing: 1px;
+    background: #29417A; color: #fff; padding: 9px 8px; text-align: left;
+    font-size: 8pt; text-transform: uppercase; letter-spacing: 0.8px;
 }
-table.index-tbl td { padding: 8px 10px; border-bottom: 1px solid #DDE2EF; vertical-align: top; }
+table.index-tbl td { padding: 7px 8px; border-bottom: 1px solid #DDE2EF; vertical-align: top; }
 table.index-tbl tr:nth-child(even) td { background: #F8FAFF; }
+.sec-tag {
+    display: inline-block; padding: 2px 7px; border-radius: 4px;
+    font-size: 7pt; font-weight: 800; letter-spacing: 0.6px; text-transform: uppercase;
+    color: #fff;
+}
+.sec-tag.main   { background: #4318FF; }
+.sec-tag.source { background: #29417A; }
+.sec-tag.task   { background: #B45F06; }
+.sec-tag.reply  { background: #107841; }
 
 /* ═══════════════ DOCUMENT ═══════════════ */
 .doc-header { padding: 18px 22px; color: #fff; border-radius: 6px 6px 0 0; }
@@ -295,12 +364,32 @@ if ($renderCover): ?>
     <div class="cover-body">
         <div class="cover-ref">REFERENCE: <?= htmlspecialchars($mainRef) ?></div>
         <div class="cover-title" lang="si"><?= htmlspecialchars(mb_substr($mainTitle, 0, 160)) ?></div>
-        <div class="cover-date">Issued on <?= date('d M Y', strtotime($mainDate)) ?></div>
+        <div class="cover-date">Letter Date <?= date('d M Y', strtotime($mainDate)) ?></div>
         <div class="cover-contents">
             <h3>Dossier Contents</h3>
             <div class="count"><?= count($chain) ?></div>
             <div class="label">Total Documents</div>
-            <div class="cover-meta">
+
+            <div class="cover-sections">
+                <div class="sec">
+                    <div class="n"><?= $sectionCounts['main'] ?></div>
+                    <div class="l">Main</div>
+                </div>
+                <div class="sec">
+                    <div class="n"><?= $sectionCounts['source'] ?></div>
+                    <div class="l">Source</div>
+                </div>
+                <div class="sec">
+                    <div class="n"><?= $sectionCounts['task'] ?></div>
+                    <div class="l">Task</div>
+                </div>
+                <div class="sec">
+                    <div class="n"><?= $sectionCounts['reply'] ?></div>
+                    <div class="l">Reply</div>
+                </div>
+            </div>
+
+            <div class="cover-meta" style="margin-top:14px;">
                 <?= $counts['internal'] ?> Internal &nbsp;·&nbsp; <?= $counts['task'] ?> Task &nbsp;·&nbsp; <?= $counts['outward'] ?> Outward
             </div>
             <div class="cover-meta" style="font-size:9pt;text-transform:uppercase;letter-spacing:1px;color:#707EAE;">
@@ -321,7 +410,15 @@ if ($renderIndex): ?>
 <div class="page-block index-page">
     <h2>Document Index</h2>
     <table class="index-tbl">
-        <thead><tr><th style="width:40px;">#</th><th style="width:90px;">Type</th><th style="width:160px;">Reference</th><th>Title</th></tr></thead>
+        <thead>
+            <tr>
+                <th style="width:34px;">#</th>
+                <th style="width:80px;">Type</th>
+                <th style="width:110px;">Section</th>
+                <th style="width:140px;">Reference</th>
+                <th>Title</th>
+            </tr>
+        </thead>
         <tbody>
         <?php foreach ($chain as $i => $c):
             $rec = $c['type'] === 'internal' ? fetchInternal($conn, $c['id'])
@@ -330,10 +427,12 @@ if ($renderIndex): ?>
             $ref = $c['type'] === 'internal' ? ($rec['cdr_number'] ?? '-')
                  : ($c['type'] === 'task' ? ($rec['tsk_cdr_number'] ?? '-') : ($rec['letter_ref'] ?? '-'));
             $ttl = $rec['letter_title'] ?? $rec['title'] ?? '-';
+            $sec = $c['section'] ?? 'main';
         ?>
             <tr>
                 <td><?= $i + 1 ?></td>
                 <td><span class="badge <?= $c['type']==='task'?'orange':($c['type']==='outward'?'green':'') ?>"><?= strtoupper($c['type']) ?></span></td>
+                <td><span class="sec-tag <?= $sec ?>"><?= strtoupper($sec) ?></span></td>
                 <td><strong><?= htmlspecialchars($ref) ?></strong></td>
                 <td lang="si"><?= htmlspecialchars(mb_substr($ttl, 0, 120)) ?></td>
             </tr>
@@ -353,19 +452,21 @@ if ($renderDocs):
 
     foreach ($docsToRender as $index => $item):
         $dt = $item['type']; $did = $item['id'];
+        $sec = $item['section'] ?? 'main';
         $rec = $dt === 'internal' ? fetchInternal($conn, $did)
              : ($dt === 'task' ? fetchTask($conn, $did) : fetchOutward($conn, $did));
         if (!$rec) continue;
 
-        $recRef = $dt === 'internal' ? $rec['cdr_number']
-                : ($dt === 'task' ? $rec['tsk_cdr_number'] : $rec['letter_ref']);
+        $recRef   = $dt === 'internal' ? $rec['cdr_number']
+                  : ($dt === 'task' ? $rec['tsk_cdr_number'] : $rec['letter_ref']);
         $headerBg = $dt === 'internal' ? '#29417A' : ($dt === 'task' ? '#B45F06' : '#107841');
+        $secName  = $sectionLabel[$sec] ?? strtoupper($sec);
 ?>
 <div class="page-block">
     <div class="doc-header" style="background:<?= $headerBg ?>;">
         <p class="num">DOCUMENT <?= $index + 1 ?> of <?= count($chain) ?></p>
         <p class="type"><?= strtoupper($dt) ?> LETTER</p>
-        <p class="label-ref"><?= htmlspecialchars($item['label']) ?> &nbsp;·&nbsp; <?= htmlspecialchars($recRef) ?></p>
+        <p class="label-ref"><?= htmlspecialchars($secName) ?> &nbsp;·&nbsp; <?= htmlspecialchars($recRef) ?></p>
     </div>
 
     <div class="doc-body">

@@ -4,6 +4,12 @@
  *   - Attachments come right after their own document
  *   - Every page gets a watermark (text + emblem)
  *   - Two-phase UX: build JSON + download button
+ *
+ * DOCUMENT CATEGORIES (in order):
+ *   1. Main Document
+ *   2. Source Documents
+ *   3. Task Documents
+ *   4. Reply Documents (replies to Task documents)
  */
 
 require_once '../../includes/auth.php';
@@ -77,7 +83,7 @@ if ($s = $conn->prepare($refSql)) {
 $cacheDir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'dossier_cache';
 if (!is_dir($cacheDir)) @mkdir($cacheDir, 0700, true);
 
-$cacheKey  = md5($type.'|'.$id.'|'.$scope.'|'.$mainUpdated.'|wm2');
+$cacheKey  = md5($type.'|'.$id.'|'.$scope.'|'.$mainUpdated.'|wm4-reply-fix');
 $cacheFile = $cacheDir . DIRECTORY_SEPARATOR . $cacheKey . '.pdf';
 
 $cleanRef = preg_replace('/[^a-zA-Z0-9_-]/', '_', $mainRef);
@@ -121,38 +127,158 @@ if ($action === 'build') {
     }
 
     try {
-        // ─────────── BUILD CHAIN ───────────
+        // ─────────── BUILD CHAIN (SECTIONED) ───────────
+        // Sections, in order:  main → source → task → reply
         $chain = (function() use ($conn, $type, $id, $scope) {
             $fetchIds = function($sql, $types, ...$params) use ($conn) {
                 $s = $conn->prepare($sql); $s->bind_param($types, ...$params); $s->execute();
                 return array_column($s->get_result()->fetch_all(MYSQLI_ASSOC), 'id');
             };
-            $chain = []; $visited = [];
-            if ($type === 'internal') {
-                $chain[] = ['type'=>'internal','id'=>$id]; $visited["internal_$id"] = true;
-                foreach ($fetchIds("SELECT DISTINCT tl.id FROM task_letters tl LEFT JOIN task_internal_links til ON tl.id=til.task_id LEFT JOIN task_replies tr ON tl.id=tr.task_letter_id WHERE til.internal_letter_id=? OR tr.reply_internal_letter_id=?", 'ii', $id, $id) as $t)
-                    if (!isset($visited["task_$t"])) { $visited["task_$t"] = true; $chain[] = ['type'=>'task','id'=>$t]; }
-                foreach ($fetchIds("SELECT o.id FROM outward_letters o JOIN outward_internal oi ON o.id=oi.outward_id WHERE oi.internal_id=? AND o.is_deleted=0", 'i', $id) as $o)
-                    if (!isset($visited["outward_$o"])) { $visited["outward_$o"] = true; $chain[] = ['type'=>'outward','id'=>$o]; }
-            } elseif ($type === 'task') {
-                $chain[] = ['type'=>'task','id'=>$id]; $visited["task_$id"] = true;
-                foreach ($fetchIds("SELECT il.id FROM task_internal_links til JOIN internal_letters il ON til.internal_letter_id=il.id WHERE til.task_id=? AND il.is_deleted=0", 'i', $id) as $i)
-                    if (!isset($visited["internal_$i"])) { $visited["internal_$i"] = true; $chain[] = ['type'=>'internal','id'=>$i]; }
-                foreach ($fetchIds("SELECT il.id FROM task_replies tr JOIN internal_letters il ON tr.reply_internal_letter_id=il.id WHERE tr.task_letter_id=?", 'i', $id) as $i)
-                    if (!isset($visited["internal_$i"])) { $visited["internal_$i"] = true; $chain[] = ['type'=>'internal','id'=>$i]; }
-                foreach ($fetchIds("SELECT DISTINCT ol.id FROM outward_letters ol JOIN outward_task ot ON ol.id=ot.outward_id WHERE ot.task_id=? AND ol.is_deleted=0", 'i', $id) as $o)
-                    if (!isset($visited["outward_$o"])) { $visited["outward_$o"] = true; $chain[] = ['type'=>'outward','id'=>$o]; }
-            } else {
-                $chain[] = ['type'=>'outward','id'=>$id]; $visited["outward_$id"] = true;
-                foreach ($fetchIds("SELECT DISTINCT il.id FROM internal_letters il JOIN outward_internal oi ON il.id=oi.internal_id WHERE oi.outward_id=? AND il.is_deleted=0", 'i', $id) as $i)
-                    if (!isset($visited["internal_$i"])) { $visited["internal_$i"] = true; $chain[] = ['type'=>'internal','id'=>$i]; }
+            $fetchRows = function($sql, $types, ...$params) use ($conn) {
+                $s = $conn->prepare($sql); $s->bind_param($types, ...$params); $s->execute();
+                return $s->get_result()->fetch_all(MYSQLI_ASSOC);
+            };
+
+            $chain   = [];
+            $visited = [];
+
+            $add = function($t, $i, $section) use (&$chain, &$visited) {
+                $key = "{$t}_{$i}";
+                if (isset($visited[$key])) return;
+                $visited[$key] = true;
+                $chain[] = ['type' => $t, 'id' => (int)$i, 'section' => $section];
+            };
+
+            // ─── PRE-COMPUTE: which internals are REPLIES ───
+            // Must be done BEFORE adding source, so replies don't get
+            // mis-categorized as "source" (they may also live in task_internal_links).
+            $replyInternalIds = [];
+
+            $taskIdsToScan = [];
+            if ($type === 'task') {
+                $taskIdsToScan[] = $id;
+            } elseif ($type === 'internal') {
+                $taskIdsToScan = $fetchIds(
+                    "SELECT DISTINCT tl.id
+                       FROM task_letters tl
+                       LEFT JOIN task_internal_links til ON tl.id = til.task_id
+                       LEFT JOIN task_replies         tr  ON tl.id = tr.task_letter_id
+                      WHERE til.internal_letter_id = ? OR tr.reply_internal_letter_id = ?",
+                    'ii', $id, $id
+                );
+            } elseif ($type === 'outward') {
+                $taskIdsToScan = $fetchIds(
+                    "SELECT DISTINCT tl.id
+                       FROM task_letters tl
+                       JOIN outward_task ot ON tl.id = ot.task_id
+                      WHERE ot.outward_id = ?",
+                    'i', $id
+                );
             }
+
+            foreach ($taskIdsToScan as $tid) {
+                $rows = $fetchRows(
+                    "SELECT reply_internal_letter_id
+                       FROM task_replies
+                      WHERE task_letter_id = ? AND reply_internal_letter_id IS NOT NULL",
+                    'i', $tid
+                );
+                foreach ($rows as $r) {
+                    $replyInternalIds[(int)$r['reply_internal_letter_id']] = true;
+                }
+            }
+
+            // ─── 1. MAIN DOCUMENT ───
+            $add($type, $id, 'main');
+
+            // ─── 2. SOURCE DOCUMENTS (exclude replies) ───
+            if ($type === 'task') {
+                $srcIds = $fetchIds(
+                    "SELECT il.id
+                       FROM task_internal_links til
+                       JOIN internal_letters il ON til.internal_letter_id = il.id
+                      WHERE til.task_id = ? AND il.is_deleted = 0
+                      ORDER BY til.linked_at ASC",
+                    'i', $id
+                );
+                foreach ($srcIds as $i) {
+                    if (isset($replyInternalIds[(int)$i])) continue;   // ← KEY FIX
+                    $add('internal', $i, 'source');
+                }
+
+            } elseif ($type === 'outward') {
+                $srcIds = $fetchIds(
+                    "SELECT DISTINCT il.id
+                       FROM internal_letters il
+                       JOIN outward_internal oi ON il.id = oi.internal_id
+                      WHERE oi.outward_id = ? AND il.is_deleted = 0
+                      ORDER BY il.id ASC",
+                    'i', $id
+                );
+                foreach ($srcIds as $i) {
+                    if (isset($replyInternalIds[(int)$i])) continue;   // ← KEY FIX
+                    $add('internal', $i, 'source');
+                }
+            }
+
+            // ─── 3. TASK DOCUMENTS ───
+            if ($type === 'internal') {
+                $taskIds = $fetchIds(
+                    "SELECT DISTINCT tl.id
+                       FROM task_letters tl
+                       LEFT JOIN task_internal_links til ON tl.id = til.task_id
+                       LEFT JOIN task_replies         tr  ON tl.id = tr.task_letter_id
+                      WHERE til.internal_letter_id = ? OR tr.reply_internal_letter_id = ?
+                      ORDER BY tl.created_at ASC",
+                    'ii', $id, $id
+                );
+                foreach ($taskIds as $t) $add('task', $t, 'task');
+
+            } elseif ($type === 'outward') {
+                $taskIds = $fetchIds(
+                    "SELECT DISTINCT tl.id
+                       FROM task_letters tl
+                       JOIN outward_task ot ON tl.id = ot.task_id
+                      WHERE ot.outward_id = ?
+                      ORDER BY tl.created_at ASC",
+                    'i', $id
+                );
+                foreach ($taskIds as $t) $add('task', $t, 'task');
+            }
+
+            // ─── 4. REPLY DOCUMENTS ───
+            $taskIdsInChain = [];
+            foreach ($chain as $c) if ($c['type'] === 'task') $taskIdsInChain[] = (int)$c['id'];
+
+            if (!empty($taskIdsInChain)) {
+                foreach ($taskIdsInChain as $tid) {
+                    $replyIds = $fetchIds(
+                        "SELECT il.id
+                           FROM task_replies tr
+                           JOIN internal_letters il ON tr.reply_internal_letter_id = il.id
+                          WHERE tr.task_letter_id = ? AND il.is_deleted = 0
+                          ORDER BY tr.replied_at ASC",
+                        'i', $tid
+                    );
+                    foreach ($replyIds as $ri) $add('internal', $ri, 'reply');
+                }
+            }
+
+            // Safety cap
             if (count($chain) > 30) $chain = array_slice($chain, 0, 30);
-            if ($scope === 'main') $chain = [$chain[0]];
-            elseif ($scope === 'internal') $chain = array_values(array_filter($chain, fn($c)=>$c['type']==='internal'));
-            elseif ($scope === 'task')     $chain = array_values(array_filter($chain, fn($c)=>$c['type']==='task'));
-            elseif ($scope === 'outward')  $chain = array_values(array_filter($chain, fn($c)=>$c['type']==='outward'));
-            if (empty($chain)) $chain = [['type'=>$type,'id'=>$id]];
+
+            // Scope filters (preserve section order)
+            if ($scope === 'main') {
+                $chain = [$chain[0]];
+            } elseif ($scope === 'internal') {
+                $chain = array_values(array_filter($chain, fn($c) => $c['type'] === 'internal'));
+            } elseif ($scope === 'task') {
+                $chain = array_values(array_filter($chain, fn($c) => $c['type'] === 'task'));
+            } elseif ($scope === 'outward') {
+                $chain = array_values(array_filter($chain, fn($c) => $c['type'] === 'outward'));
+            }
+
+            if (empty($chain)) $chain = [['type'=>$type,'id'=>$id,'section'=>'main']];
             return $chain;
         })();
 
@@ -220,11 +346,12 @@ if ($action === 'build') {
         if ($indexPdf) { $tmpFiles[] = $indexPdf; $orderedParts[] = ['file'=>$indexPdf, 'kind'=>'index']; }
 
         // 2. Each document → its own PDF, then attachment right after
+        //    Chain is already ordered by section (main → source → task → reply)
         foreach ($chain as $i => $item) {
             $docPdf = $chromeToPdf($base . '&part=doc&idx=' . $i);
             if ($docPdf) {
                 $tmpFiles[] = $docPdf;
-                $orderedParts[] = ['file'=>$docPdf, 'kind'=>'doc', 'chainIdx'=>$i];
+                $orderedParts[] = ['file'=>$docPdf, 'kind'=>'doc', 'chainIdx'=>$i, 'section'=>$item['section'] ?? 'main'];
             }
 
             if (!$includeAttachments) continue;
@@ -259,7 +386,7 @@ if ($action === 'build') {
                 $rootReal = realpath($root_dir);
                 if ($real && $rootReal && strpos($real, $rootReal) === 0
                     && strtolower(pathinfo($real, PATHINFO_EXTENSION)) === 'pdf') {
-                    $orderedParts[] = ['file'=>$real, 'kind'=>'attachment', 'chainIdx'=>$i];
+                    $orderedParts[] = ['file'=>$real, 'kind'=>'attachment', 'chainIdx'=>$i, 'section'=>$item['section'] ?? 'main'];
                 }
             }
         }
